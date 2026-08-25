@@ -1,0 +1,64 @@
+{
+  "enabled": {
+    "name": "启用错误通知",
+    "type": "switch",
+    "default": false,
+    "hint": "填写并确认主人会话后再开启。"
+  },
+  "monitor_mode": {
+    "name": "监控模式",
+    "type": "enum",
+    "default": "on_exception",
+    "options": ["on_exception", "all_error"],
+    "hint": "on_exception 仅报告 KiraAI ON_EXCEPTION；all_error 监听 KiraAI 日志系统中的全部 ERROR/CRITICAL。"
+  },
+  "target_session": {
+    "name": "主人目标会话",
+    "type": "string",
+    "default": "",
+    "hint": "格式：适配器实例名:dm:账号，例如 qq:dm:123456789。也支持 gm 群会话。"
+  },
+  "message_template": {
+    "name": "通知内容模板",
+    "type": "textarea",
+    "default": "【KiraAI 异常提醒】\n\n时间：{time}\n来源：{source}\n模块：{component}\n阶段：{stage}\n异常：{error_type}\n摘要：{summary}\n相同错误已合并：{repeat_count} 次\n\nKiraAI 当前进程仍在运行。",
+    "hint": "可用变量：{time} {source} {component} {stage} {error_type} {summary} {repeat_count} {mode}。不写变量时会发送固定内容。"
+  },
+  "include_error_summary": {
+    "name": "附带脱敏错误摘要",
+    "type": "switch",
+    "default": true,
+    "hint": "关闭后仍发送异常类型和来源，但摘要显示为已隐藏。"
+  },
+  "cooldown_seconds": {
+    "name": "相同错误冷却时间（秒）",
+    "type": "integer",
+    "default": 300,
+    "minimum": 0,
+    "maximum": 86400,
+    "hint": "冷却期内的相同错误会被合并，避免告警刷屏。"
+  },
+  "max_alerts_per_hour": {
+    "name": "每小时最多提醒数",
+    "type": "integer",
+    "default": 10,
+    "minimum": 1,
+    "maximum": 1000,
+    "hint": "所有错误共用此上限。"
+  },
+  "max_summary_chars": {
+    "name": "错误摘要最大字符数",
+    "type": "integer",
+    "default": 400,
+    "minimum": 100,
+    "maximum": 2000,
+    "hint": "超出部分会截断，不发送完整调用栈。"
+  },
+  "notify_on_start": {
+    "name": "启动后报平安",
+    "type": "switch",
+    "default": false,
+    "hint": "插件加载成功后发送一次恢复提醒。"
+  }
+}
+
