@@ -211,6 +211,7 @@ class ErrorNotifierPlugin(BasePlugin):
         self.max_summary_chars = self._as_int(
             cfg.get("max_summary_chars", 400), 400, 100, 2000
         )
+        self.error_blacklist = self._as_blacklist(cfg.get("error_blacklist", ""))
 
         self._gate = AlertGate(self.cooldown_seconds, self.max_alerts_per_hour)
         self._queue: asyncio.Queue[Alert] = asyncio.Queue(maxsize=100)
@@ -233,6 +234,36 @@ class ErrorNotifierPlugin(BasePlugin):
         except (TypeError, ValueError):
             parsed = default
         return min(max(parsed, minimum), maximum)
+
+    @staticmethod
+    def _as_blacklist(value: object) -> tuple[str, ...]:
+        if isinstance(value, str):
+            candidates = value.splitlines()
+        elif isinstance(value, (list, tuple, set)):
+            candidates = value
+        else:
+            candidates = ()
+
+        patterns = []
+        for candidate in candidates:
+            pattern = str(candidate or "").strip().casefold()
+            if pattern and pattern not in patterns:
+                patterns.append(pattern)
+        return tuple(patterns)
+
+    def _is_blacklisted(self, alert: Alert) -> bool:
+        if not self.error_blacklist:
+            return False
+        searchable = "\n".join(
+            (
+                alert.source,
+                alert.component,
+                alert.stage,
+                alert.error_type,
+                alert.summary,
+            )
+        ).casefold()
+        return any(pattern in searchable for pattern in self.error_blacklist)
 
     async def initialize(self):
         if not self.enabled:
@@ -336,6 +367,8 @@ class ErrorNotifierPlugin(BasePlugin):
             error_type=sanitize_text(error_type, 120),
             summary=summarize_error_text(summary, self.max_summary_chars),
         )
+        if self._is_blacklisted(alert):
+            return
         self._schedule_log_alert(alert)
 
     def _schedule_log_alert(self, alert: Alert):
@@ -362,7 +395,7 @@ class ErrorNotifierPlugin(BasePlugin):
         self._enqueue_nowait(alert)
 
     def _enqueue_nowait(self, alert: Alert):
-        if not self._active:
+        if not self._active or self._is_blacklisted(alert):
             return
         try:
             self._queue.put_nowait(alert)
@@ -461,4 +494,3 @@ class ErrorNotifierPlugin(BasePlugin):
         self._attached_loggers.clear()
         self._log_handler.close()
         self._log_handler = None
-
