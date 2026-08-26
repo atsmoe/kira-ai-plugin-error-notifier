@@ -30,6 +30,12 @@
     "default": true,
     "hint": "关闭后仍发送异常类型和来源，但摘要显示为已隐藏。"
   },
+  "error_blacklist": {
+    "name": "错误黑名单",
+    "type": "textarea",
+    "default": "",
+    "hint": "每行填写一个关键词，大小写不敏感；命中来源、模块、阶段、异常类型或摘要后不发送提醒。留空表示关闭。"
+  },
   "cooldown_seconds": {
     "name": "相同错误冷却时间（秒）",
     "type": "integer",
@@ -61,4 +67,3 @@
     "hint": "插件加载成功后发送一次恢复提醒。"
   }
 }
-
