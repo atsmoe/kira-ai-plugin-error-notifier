@@ -34,7 +34,20 @@ qq:dm:123456789
 - 自动遮盖常见 token、密钥、密码、Bearer 凭据、URL 敏感参数和长数字 ID。
 - 插件自己的发送错误不会再次触发通知。
 
+## 错误黑名单
+
+`error_blacklist` 是可选的多行配置，每行填写一个关键词。匹配不区分大小写，
+会检查来源、模块、阶段、异常类型和脱敏后的错误摘要；命中任意关键词的错误会
+直接忽略，不进入提醒队列，也不会占用冷却或每小时提醒额度。留空即可关闭过滤。
+
+例如：
+
+```text
+TimeoutError
+database is read-only
+rate limit probe
+```
+
 ## 限制
 
 `all_error` 监听的是 KiraAI Python 日志系统，不包括 NapCat Docker 日志、systemd 日志或整台服务器宕机。若 NapCat/QQ 适配器已经不可用，也无法再通过该适配器发送提醒；这类故障需要 ntfy 等独立渠道监控。
-
