@@ -191,6 +191,47 @@ class AlertGateTests(unittest.TestCase):
 
 
 class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_blacklisted_exception_is_not_sent(self):
+        ctx = FakeContext()
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "on_exception",
+                "target_session": "qq:dm:1",
+                "error_blacklist": "temporary upstream failure\nignoredtype",
+                "cooldown_seconds": 0,
+            },
+        )
+        await plugin.initialize()
+        try:
+            await plugin.handle_exception(
+                None,
+                KiraExceptionEvent(
+                    name="IgnoredType",
+                    message="should not be sent",
+                    source="provider",
+                    comp_id="openai",
+                    stage="agent_loop",
+                ),
+            )
+            await plugin.handle_exception(
+                None,
+                KiraExceptionEvent(
+                    name="APIError",
+                    message="TEMPORARY upstream failure while retrying",
+                    source="provider",
+                    comp_id="openai",
+                    stage="agent_loop",
+                ),
+            )
+            await asyncio.sleep(0)
+
+            self.assertEqual(ctx.sent, [])
+            self.assertTrue(plugin._queue.empty())
+        finally:
+            await plugin.terminate()
+
     async def test_on_exception_mode_sends_exact_template_with_redaction(self):
         ctx = FakeContext()
         plugin = PLUGIN.ErrorNotifierPlugin(
@@ -250,6 +291,37 @@ class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(ctx.sent), 1)
             self.assertIn("source_for_all_error_test|ERROR", ctx.sent[0][1])
             self.assertNotIn("do-not-send", ctx.sent[0][1])
+        finally:
+            await plugin.terminate()
+            KIRA_LOGGING._created_by_get_logger.discard(logger.name)
+            logger.handlers.clear()
+
+    async def test_blacklisted_log_is_not_sent_or_scheduled(self):
+        ctx = FakeContext()
+        logger = logging.getLogger("source_for_blacklist_test")
+        logger.handlers.clear()
+        logger.setLevel(logging.DEBUG)
+        logger.propagate = False
+        KIRA_LOGGING._created_by_get_logger.add(logger.name)
+
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "all_error",
+                "target_session": "qq:dm:1",
+                "error_blacklist": ["database is read-only"],
+                "cooldown_seconds": 0,
+            },
+        )
+        await plugin.initialize()
+        try:
+            logger.error("DATABASE is read-only during startup")
+            await asyncio.sleep(0)
+            await asyncio.wait_for(plugin._queue.join(), timeout=1)
+
+            self.assertEqual(ctx.sent, [])
+            self.assertEqual(plugin._pending_log_callbacks, 0)
         finally:
             await plugin.terminate()
             KIRA_LOGGING._created_by_get_logger.discard(logger.name)
@@ -340,4 +412,3 @@ class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
-
