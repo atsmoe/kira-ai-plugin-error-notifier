@@ -1,7 +1,7 @@
 {
   "display_name": "错误通知 / Error Notifier",
   "plugin_id": "kira-ai-plugin-error-notifier",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": "atsmoe",
   "description": "将 KiraAI 异常事件或全部 ERROR 日志经指定适配器发送给主人。",
   "tags": ["error", "notification", "monitoring"],
