@@ -240,6 +240,7 @@ class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
                 "enabled": True,
                 "monitor_mode": "on_exception",
                 "target_session": "qq:dm:1",
+                "compact_notification_mode": False,
                 "message_template": "{source}|{component}|{error_type}|{summary}|{repeat_count}",
                 "cooldown_seconds": 0,
             },
@@ -264,6 +265,64 @@ class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await plugin.terminate()
 
+    async def test_compact_notification_mode_is_default_and_omits_error_payload(self):
+        ctx = FakeContext()
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "on_exception",
+                "target_session": "qq:dm:1",
+                "message_template": (
+                    "{source}|{component}|{stage}|{error_type}|{summary}|{repeat_count}"
+                ),
+                "cooldown_seconds": 0,
+            },
+        )
+        await plugin.initialize()
+        try:
+            event = KiraExceptionEvent(
+                name="RAW_ERROR_TYPE_MARKER",
+                message=(
+                    "RAW_SUMMARY_MARKER https://blocked.example.test/private "
+                    "/srv/private/module.py Authorization: Basic dGVzdA== "
+                    "Cookie: session=session-secret password='two words'"
+                ),
+                source="RAW_SOURCE_MARKER",
+                comp_id="RAW_COMPONENT_MARKER",
+                stage="RAW_STAGE_MARKER",
+            )
+            with self.assertLogs(PLUGIN.NOTIFIER_LOGGER_NAME, level="INFO") as logs:
+                await plugin.handle_exception(None, event)
+                await asyncio.wait_for(plugin._queue.join(), timeout=1)
+
+            self.assertEqual(len(ctx.sent), 1)
+            content = ctx.sent[0][1]
+            self.assertIn("KiraAI 状态提醒", content)
+            self.assertIn("请检查服务器日志", content)
+            self.assertNotIn("RAW_", content)
+            self.assertNotIn("https://", content)
+            self.assertNotIn("/srv/", content)
+            self.assertNotIn("dGVzdA==", content)
+            self.assertNotIn("session-secret", content)
+            self.assertNotIn("two words", content)
+            self.assertLessEqual(len(content), 160)
+            alert_id = next(
+                line.removeprefix("编号：")
+                for line in content.splitlines()
+                if line.startswith("编号：")
+            )
+            self.assertRegex(alert_id, r"^[0-9a-f]{12}$")
+            self.assertTrue(any(f"id={alert_id}" in record for record in logs.output))
+            self.assertFalse(any("RAW_" in record for record in logs.output))
+            self.assertFalse(any("https://" in record for record in logs.output))
+            self.assertFalse(any("/srv/" in record for record in logs.output))
+            self.assertFalse(any("dGVzdA==" in record for record in logs.output))
+            self.assertFalse(any("session-secret" in record for record in logs.output))
+            self.assertFalse(any("two words" in record for record in logs.output))
+        finally:
+            await plugin.terminate()
+
     async def test_all_error_mode_captures_kira_logger(self):
         ctx = FakeContext()
         logger = logging.getLogger("source_for_all_error_test")
@@ -278,6 +337,7 @@ class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
                 "enabled": True,
                 "monitor_mode": "all_error",
                 "target_session": "qq:dm:1",
+                "compact_notification_mode": False,
                 "message_template": "{component}|{error_type}|{summary}",
                 "cooldown_seconds": 0,
             },

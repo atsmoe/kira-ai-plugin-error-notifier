@@ -18,17 +18,23 @@
     "default": "",
     "hint": "格式：适配器实例名:dm:账号，例如 qq:dm:123456789。也支持 gm 群会话。"
   },
+  "compact_notification_mode": {
+    "name": "精简通知模式（推荐 QQ）",
+    "type": "switch",
+    "default": true,
+    "hint": "开启后只发送固定短提示、时间、关联编号和合并次数，不把来源、模块、异常类型或错误正文发到聊天平台。可凭编号找到服务器端通知记录，再检查相邻错误日志。"
+  },
   "message_template": {
     "name": "通知内容模板",
     "type": "textarea",
     "default": "【KiraAI 异常提醒】\n\n时间：{time}\n来源：{source}\n模块：{component}\n阶段：{stage}\n异常：{error_type}\n摘要：{summary}\n相同错误已合并：{repeat_count} 次\n\nKiraAI 当前进程仍在运行。",
-    "hint": "可用变量：{time} {source} {component} {stage} {error_type} {summary} {repeat_count} {mode}。不写变量时会发送固定内容。"
+    "hint": "仅在关闭精简通知模式后使用。可用变量：{time} {source} {component} {stage} {error_type} {summary} {repeat_count} {mode}。不写变量时会发送固定内容。"
   },
   "include_error_summary": {
     "name": "附带脱敏错误摘要",
     "type": "switch",
     "default": true,
-    "hint": "关闭后仍发送异常类型和来源，但摘要显示为已隐藏。"
+    "hint": "仅在关闭精简通知模式后生效。关闭后仍发送异常类型和来源，但摘要显示为已隐藏。"
   },
   "error_blacklist": {
     "name": "错误黑名单",

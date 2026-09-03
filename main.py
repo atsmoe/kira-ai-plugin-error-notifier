@@ -35,6 +35,13 @@ DEFAULT_MESSAGE_TEMPLATE = """【KiraAI 异常提醒】
 
 KiraAI 当前进程仍在运行。"""
 
+DEFAULT_COMPACT_MESSAGE_TEMPLATE = """KiraAI 状态提醒
+时间：{time}
+状态：需要检查
+编号：{alert_id}
+合并提醒：{repeat_count} 次
+请检查服务器日志。"""
+
 _notifier_logger = get_logger(NOTIFIER_LOGGER_NAME, "red")
 
 _SENSITIVE_VALUE_RE = re.compile(
@@ -198,6 +205,9 @@ class ErrorNotifierPlugin(BasePlugin):
             self.monitor_mode = MODE_ON_EXCEPTION
 
         self.target_session = str(cfg.get("target_session", "")).strip()
+        self.compact_notification_mode = bool(
+            cfg.get("compact_notification_mode", True)
+        )
         self.message_template = str(
             cfg.get("message_template", DEFAULT_MESSAGE_TEMPLATE)
             or DEFAULT_MESSAGE_TEMPLATE
@@ -415,6 +425,11 @@ class ErrorNotifierPlugin(BasePlugin):
             try:
                 allowed, repeat_count = self._gate.check(alert.fingerprint)
                 if allowed:
+                    if self.compact_notification_mode:
+                        _notifier_logger.info(
+                            "Compact alert id=%s; inspect adjacent error records for details",
+                            self._alert_id(alert),
+                        )
                     await self._send_text(self._render_message(alert, repeat_count))
             except asyncio.CancelledError:
                 raise
@@ -424,6 +439,15 @@ class ErrorNotifierPlugin(BasePlugin):
                 self._queue.task_done()
 
     def _render_message(self, alert: Alert, repeat_count: int) -> str:
+        if self.compact_notification_mode:
+            return DEFAULT_COMPACT_MESSAGE_TEMPLATE.format_map(
+                {
+                    "time": alert.timestamp,
+                    "alert_id": self._alert_id(alert),
+                    "repeat_count": repeat_count,
+                }
+            )
+
         summary = alert.summary if self.include_error_summary else "（已按配置隐藏）"
         values = {
             "time": alert.timestamp,
@@ -442,6 +466,10 @@ class ErrorNotifierPlugin(BasePlugin):
                 "Invalid message_template (%s); using the default template", exc
             )
             return DEFAULT_MESSAGE_TEMPLATE.format_map(values)
+
+    @staticmethod
+    def _alert_id(alert: Alert) -> str:
+        return alert.fingerprint[:12]
 
     async def _send_text(self, content: str):
         self._sending_notification = True
