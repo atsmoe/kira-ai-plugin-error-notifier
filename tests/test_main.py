@@ -112,6 +112,35 @@ class FakeContext:
 
 
 class SanitizeTests(unittest.TestCase):
+    def test_readable_compact_notifications(self):
+        plugin = PLUGIN.ErrorNotifierPlugin(FakeContext(), {})
+        cases = [
+            ("RateLimitError", "429 Too Many Requests", "模型请求受到限流"),
+            ("APITimeoutError", "request timed out", "模型响应超时"),
+            ("APIConnectionError", "connection failed", "无法连接模型服务"),
+            ("AuthenticationError", "401 Unauthorized", "模型服务认证失败"),
+        ]
+        for error_type, summary, expected in cases:
+            alert = PLUGIN.Alert("2026-09-05 13:10:00 +0800", "provider", "private", "agent_loop", error_type, summary)
+            content = plugin._render_message(alert, 0)
+            self.assertIn(expected, content)
+            self.assertIn("环节：模型调用", content)
+            self.assertNotIn("0 次", content)
+            self.assertNotIn("编号", content)
+            self.assertNotIn("private", content)
+            self.assertIn("13:10:00", content)
+            self.assertIn("相同错误已合并：2 次", plugin._render_message(alert, 2))
+
+    def test_unknown_summary_is_short_and_sanitized(self):
+        plugin = PLUGIN.ErrorNotifierPlugin(FakeContext(), {})
+        raw = "database locked https://private.test/path /srv/private/file.py Authorization: Basic abc123== Cookie: session=private password='two words'"
+        alert = PLUGIN.Alert("13:10", "tool", "private", "agent_loop", "Error", raw)
+        content = plugin._render_message(alert, 0)
+        self.assertIn("database locked", content)
+        self.assertIn("工具执行", content)
+        for secret in ("https://", "/srv/", "abc123", "session=", "two words"):
+            self.assertNotIn(secret, content)
+
     def test_redacts_credentials_url_secrets_and_long_ids(self):
         raw = (
             "Authorization=Bearer abc.def token=my-token password:hello "
@@ -127,7 +156,7 @@ class SanitizeTests(unittest.TestCase):
         self.assertNotIn("json-secret", result)
         self.assertNotIn("123456789", result)
         self.assertIn("[REDACTED]", result)
-        self.assertIn("[ID]", result)
+        self.assertEqual(PLUGIN.sanitize_text("QQ=123456789"), "QQ=[ID]")
 
     def test_truncates_long_summary(self):
         self.assertEqual(PLUGIN.sanitize_text("abcdef", 5), "abcd…")
@@ -240,6 +269,7 @@ class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
                 "enabled": True,
                 "monitor_mode": "on_exception",
                 "target_session": "qq:dm:1",
+                "compact_notification_mode": False,
                 "message_template": "{source}|{component}|{error_type}|{summary}|{repeat_count}",
                 "cooldown_seconds": 0,
             },
@@ -264,6 +294,60 @@ class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await plugin.terminate()
 
+    async def test_compact_notification_mode_is_default_and_omits_error_payload(self):
+        ctx = FakeContext()
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "on_exception",
+                "target_session": "qq:dm:1",
+                "message_template": (
+                    "{source}|{component}|{stage}|{error_type}|{summary}|{repeat_count}"
+                ),
+                "cooldown_seconds": 0,
+            },
+        )
+        await plugin.initialize()
+        try:
+            event = KiraExceptionEvent(
+                name="RAW_ERROR_TYPE_MARKER",
+                message=(
+                    "RAW_SUMMARY_MARKER https://blocked.example.test/private "
+                    "/srv/private/module.py Authorization: Basic dGVzdA== "
+                    "Cookie: session=session-secret password='two words'"
+                ),
+                source="RAW_SOURCE_MARKER",
+                comp_id="RAW_COMPONENT_MARKER",
+                stage="RAW_STAGE_MARKER",
+            )
+            with self.assertLogs(PLUGIN.NOTIFIER_LOGGER_NAME, level="INFO") as logs:
+                await plugin.handle_exception(None, event)
+                await asyncio.wait_for(plugin._queue.join(), timeout=1)
+
+            self.assertEqual(len(ctx.sent), 1)
+            content = ctx.sent[0][1]
+            self.assertIn("KiraAI 提醒", content)
+            self.assertIn("请检查服务器日志", content)
+            self.assertIn("RAW_SUMMARY_MARKER", content)
+            self.assertNotIn("RAW_COMPONENT_MARKER", content)
+            self.assertNotIn("https://", content)
+            self.assertNotIn("/srv/", content)
+            self.assertNotIn("dGVzdA==", content)
+            self.assertNotIn("session-secret", content)
+            self.assertNotIn("two words", content)
+            self.assertLessEqual(len(content), 160)
+            self.assertNotIn("编号：", content)
+            self.assertTrue(any("id=" in record for record in logs.output))
+            self.assertFalse(any("RAW_" in record for record in logs.output))
+            self.assertFalse(any("https://" in record for record in logs.output))
+            self.assertFalse(any("/srv/" in record for record in logs.output))
+            self.assertFalse(any("dGVzdA==" in record for record in logs.output))
+            self.assertFalse(any("session-secret" in record for record in logs.output))
+            self.assertFalse(any("two words" in record for record in logs.output))
+        finally:
+            await plugin.terminate()
+
     async def test_all_error_mode_captures_kira_logger(self):
         ctx = FakeContext()
         logger = logging.getLogger("source_for_all_error_test")
@@ -278,6 +362,7 @@ class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
                 "enabled": True,
                 "monitor_mode": "all_error",
                 "target_session": "qq:dm:1",
+                "compact_notification_mode": False,
                 "message_template": "{component}|{error_type}|{summary}",
                 "cooldown_seconds": 0,
             },
