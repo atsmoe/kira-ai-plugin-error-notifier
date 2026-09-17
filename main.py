@@ -176,6 +176,55 @@ def sanitize_text(value: object, max_chars: int = 400) -> str:
     return text
 
 
+def readable_alert(alert: "Alert", include_summary: bool = True) -> tuple[str, str, str]:
+    """Build a readable compact reason without inferring final recovery."""
+    source = alert.source.casefold()
+    stage = alert.stage.casefold()
+    phase = {
+        "provider": "模型调用",
+        "tool": "工具执行",
+        "plugin": "插件处理",
+        "adapter": "消息适配器",
+    }.get(source, "消息处理")
+    sending = stage in {"send", "send_message", "send_message_chain"}
+    if sending:
+        phase = "消息发送"
+
+    evidence = (alert.error_type + " " + alert.summary).casefold()
+    prefix = "模型" if source == "provider" else "服务"
+    if re.search(r"ratelimit|rate.?limit|too many requests|\b429\b|限流", evidence):
+        return phase, f"{prefix}请求受到限流，本次调用失败。", "稍后重试。"
+    if re.search(r"timeout|timed out|超时", evidence):
+        return phase, f"{prefix}响应超时。", "稍后重试，持续出现请检查连接。"
+    if re.search(r"authenticationerror|unauthorized|\b401\b", evidence):
+        return phase, f"{prefix}服务认证失败。", "检查服务凭据是否有效。"
+    if re.search(r"permissiondenied|forbidden|\b403\b", evidence):
+        return phase, f"{prefix}拒绝了本次请求。", "检查服务权限。"
+    if re.search(
+        r"connectionerror|connection failed|connection refused|连接失败", evidence
+    ):
+        return phase, f"无法连接{prefix}服务。", "检查服务和网络连接。"
+    if sending:
+        return phase, "消息发送失败。", "检查消息适配器连接和发送限制。"
+    if not include_summary:
+        return phase, "处理失败（摘要已按配置隐藏）。", "请检查服务器日志。"
+
+    summary = summarize_error_text(alert.summary, 400)
+    summary = re.sub(
+        r"(?i)\b(?:https?|wss?)://\S+|(?:[A-Za-z]:[\\/]|/)[^\s]+",
+        "[已隐藏]",
+        summary,
+    )
+    summary = re.split(
+        r"(?i)\b(?:authorization|cookie|password|token|secret|api[_-]?key|"
+        r"response|body|payload)\s*[:=]|[\{\[]",
+        summary,
+        maxsplit=1,
+    )[0].strip()
+    summary = sanitize_text(summary, 80)
+    return phase, f"处理失败：{summary}", "请检查服务器日志。"
+
+
 def summarize_error_text(value: object, max_chars: int = 400) -> str:
     """Return a redacted one-line summary and omit Python traceback frames."""
     raw = str(value or "")
@@ -308,6 +357,9 @@ class ErrorNotifierPlugin(BasePlugin):
             self.monitor_mode = MODE_ON_EXCEPTION
 
         self.target_session = str(cfg.get("target_session", "")).strip()
+        self.compact_notification_mode = bool(
+            cfg.get("compact_notification_mode", True)
+        )
         self.send_timeout_seconds = self._as_int(
             cfg.get("send_timeout_seconds", 15), 15, 1, 300
         )
@@ -564,6 +616,11 @@ class ErrorNotifierPlugin(BasePlugin):
             try:
                 allowed, repeat_count = self._gate.check(alert.fingerprint)
                 if allowed:
+                    if self.compact_notification_mode:
+                        _notifier_logger.info(
+                            "Compact alert id=%s; inspect adjacent error records for details",
+                            self._alert_id(alert),
+                        )
                     await self._send_text(self._render_message(alert, repeat_count))
                 else:
                     self.delivery_stats.rate_limited += 1
@@ -575,6 +632,27 @@ class ErrorNotifierPlugin(BasePlugin):
                 self._queue.task_done()
 
     def _render_message(self, alert: Alert, repeat_count: int) -> str:
+        if self.compact_notification_mode:
+            phase, reason, suggestion = readable_alert(
+                alert, self.include_error_summary
+            )
+            clock_match = re.search(r"\b\d{2}:\d{2}:\d{2}\b", alert.timestamp)
+            time_text = (
+                clock_match.group()
+                if clock_match
+                else sanitize_text(alert.timestamp, 30)
+            )
+            lines = [
+                "KiraAI 提醒",
+                f"环节：{phase}",
+                reason,
+                f"建议：{suggestion}",
+                f"时间：{time_text}",
+            ]
+            if repeat_count > 0:
+                lines.append(f"相同错误已合并：{repeat_count} 次")
+            return "\n".join(lines)
+
         summary = alert.summary if self.include_error_summary else "（已按配置隐藏）"
         values = {
             "time": alert.timestamp,
@@ -593,6 +671,10 @@ class ErrorNotifierPlugin(BasePlugin):
                 "Invalid message_template (%s); using the default template", exc
             )
             return DEFAULT_MESSAGE_TEMPLATE.format_map(values)
+
+    @staticmethod
+    def _alert_id(alert: Alert) -> str:
+        return alert.fingerprint[:12]
 
     async def _send_text(self, content: str) -> bool:
         self.delivery_stats.attempted += 1

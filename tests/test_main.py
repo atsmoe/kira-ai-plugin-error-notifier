@@ -122,7 +122,70 @@ class FakeContext:
         return FakeResult()
 
 
+class MetadataTests(unittest.TestCase):
+    def test_v032_exposes_compact_mode_and_bounded_send_contract(self):
+        manifest = json.loads((PLUGIN_ROOT / "manifest.json").read_text(encoding="utf-8"))
+        schema = json.loads((PLUGIN_ROOT / "schema.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(manifest["version"], "0.3.2")
+        self.assertTrue(schema["compact_notification_mode"]["default"])
+        self.assertEqual(schema["send_timeout_seconds"]["minimum"], 1)
+        self.assertEqual(schema["send_timeout_seconds"]["maximum"], 300)
+
+
 class SanitizeTests(unittest.TestCase):
+    def test_readable_compact_notifications(self):
+        plugin = PLUGIN.ErrorNotifierPlugin(FakeContext(), {})
+        cases = (
+            ("RateLimitError", "429 Too Many Requests", "模型请求受到限流"),
+            ("APITimeoutError", "request timed out", "模型响应超时"),
+            ("APIConnectionError", "connection failed", "无法连接模型服务"),
+            ("AuthenticationError", "401 Unauthorized", "模型服务认证失败"),
+        )
+
+        for error_type, summary, expected in cases:
+            with self.subTest(error_type=error_type):
+                alert = PLUGIN.Alert(
+                    "2026-09-17 13:10:00 +0800",
+                    "provider",
+                    "private-component",
+                    "agent_loop",
+                    error_type,
+                    summary,
+                )
+                content = plugin._render_message(alert, 0)
+                self.assertIn(expected, content)
+                self.assertIn("环节：模型调用", content)
+                self.assertNotIn("0 次", content)
+                self.assertNotIn("编号", content)
+                self.assertNotIn("private-component", content)
+                self.assertIn("13:10:00", content)
+                self.assertIn("相同错误已合并：2 次", plugin._render_message(alert, 2))
+
+    def test_unknown_compact_summary_is_readable_short_and_sanitized(self):
+        plugin = PLUGIN.ErrorNotifierPlugin(FakeContext(), {})
+        raw = (
+            "database locked https://example.invalid/private /srv/private/file.py "
+            'headers={"Authorization": "Basic SYNTH_COMPACT_SECRET TWO"} '
+            "password='SYNTH_COMPACT_PASSWORD WORDS'"
+        )
+        alert = PLUGIN.Alert(
+            "13:10", "tool", "private-component", "agent_loop", "Error", raw
+        )
+        content = plugin._render_message(alert, 0)
+
+        self.assertIn("database locked", content)
+        self.assertIn("工具执行", content)
+        self.assertLessEqual(len(content), 160)
+        for secret in (
+            "https://",
+            "/srv/",
+            "SYNTH_COMPACT_SECRET",
+            "SYNTH_COMPACT_PASSWORD",
+            "private-component",
+        ):
+            self.assertNotIn(secret, content)
+
     def test_authorization_shape_matrix_is_redacted_conservatively(self):
         samples = (
             (
@@ -302,6 +365,54 @@ class AlertGateTests(unittest.TestCase):
 
 
 class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_compact_notification_is_default_and_omits_raw_payload(self):
+        ctx = FakeContext()
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "on_exception",
+                "target_session": "synthetic:dm:test-target",
+                "message_template": (
+                    "{source}|{component}|{stage}|{error_type}|{summary}|{repeat_count}"
+                ),
+                "cooldown_seconds": 0,
+            },
+        )
+        await plugin.initialize()
+        try:
+            event = KiraExceptionEvent(
+                name="RAW_ERROR_TYPE_MARKER",
+                message=(
+                    "RAW_SUMMARY_MARKER https://example.invalid/private "
+                    "/srv/private/module.py Authorization: Basic SYNTH_RAW_SECRET "
+                    "password='SYNTH_RAW_PASSWORD TWO WORDS'"
+                ),
+                source="RAW_SOURCE_MARKER",
+                comp_id="RAW_COMPONENT_MARKER",
+                stage="RAW_STAGE_MARKER",
+            )
+            with self.assertLogs(PLUGIN.NOTIFIER_LOGGER_NAME, level="INFO") as logs:
+                await plugin.handle_exception(None, event)
+                await asyncio.wait_for(plugin._queue.join(), timeout=0.5)
+
+            self.assertEqual(len(ctx.sent), 1)
+            content = ctx.sent[0][1]
+            self.assertIn("KiraAI 提醒", content)
+            self.assertIn("请检查服务器日志", content)
+            self.assertIn("RAW_SUMMARY_MARKER", content)
+            self.assertNotIn("RAW_COMPONENT_MARKER", content)
+            self.assertNotIn("https://", content)
+            self.assertNotIn("/srv/", content)
+            self.assertNotIn("SYNTH_RAW_SECRET", content)
+            self.assertNotIn("SYNTH_RAW_PASSWORD", content)
+            self.assertLessEqual(len(content), 160)
+            self.assertNotIn("编号：", content)
+            self.assertTrue(any("id=" in record for record in logs.output))
+            self.assertFalse(any("RAW_" in record for record in logs.output))
+        finally:
+            await plugin.terminate()
+
     async def test_send_log_suppression_survives_module_reload_without_global_silence(self):
         adapter_logger = logging.getLogger("source_for_reload_adapter_error")
         business_logger = logging.getLogger("source_for_reload_business_error")
@@ -438,6 +549,7 @@ class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
                 "enabled": True,
                 "monitor_mode": "on_exception",
                 "target_session": "synthetic:dm:test-target",
+                "compact_notification_mode": False,
                 "message_template": "{component}|{error_type}|{summary}",
                 "cooldown_seconds": 0,
             },
@@ -900,6 +1012,7 @@ class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
                 "enabled": True,
                 "monitor_mode": "on_exception",
                 "target_session": "synthetic:dm:test-target",
+                "compact_notification_mode": False,
                 "message_template": "{component}|{error_type}|{summary}",
                 "cooldown_seconds": 0,
             },
@@ -937,6 +1050,7 @@ class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
                 "enabled": True,
                 "monitor_mode": "on_exception",
                 "target_session": "synthetic:dm:test-target",
+                "compact_notification_mode": False,
                 "message_template": "{component}|{error_type}|{summary}",
                 "include_error_summary": False,
                 "cooldown_seconds": 0,
@@ -1027,6 +1141,7 @@ class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
                 "enabled": True,
                 "monitor_mode": "on_exception",
                 "target_session": "qq:dm:1",
+                "compact_notification_mode": False,
                 "message_template": "{source}|{component}|{error_type}|{summary}|{repeat_count}",
                 "cooldown_seconds": 0,
             },
@@ -1065,6 +1180,7 @@ class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
                 "enabled": True,
                 "monitor_mode": "all_error",
                 "target_session": "qq:dm:1",
+                "compact_notification_mode": False,
                 "message_template": "{component}|{error_type}|{summary}",
                 "cooldown_seconds": 0,
             },
