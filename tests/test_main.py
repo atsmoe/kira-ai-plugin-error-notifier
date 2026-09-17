@@ -1,5 +1,6 @@
 import asyncio
 import importlib.util
+import json
 import logging
 import sys
 import types
@@ -112,6 +113,18 @@ class FakeContext:
 
 
 class SanitizeTests(unittest.TestCase):
+    def test_synthetic_sensitive_samples_are_redacted_and_readable(self):
+        samples_path = PLUGIN_ROOT / "tests" / "fixtures" / "sensitive_alert_samples.json"
+        samples = json.loads(samples_path.read_text(encoding="utf-8"))
+
+        for sample in samples:
+            with self.subTest(sample=sample["name"]):
+                result = PLUGIN.sanitize_text(sample["text"], 1000)
+                for secret in sample["secrets"]:
+                    self.assertNotIn(secret, result)
+                for visible in sample["visible"]:
+                    self.assertIn(visible, result)
+
     def test_redacts_credentials_url_secrets_and_long_ids(self):
         raw = (
             "Authorization=Bearer abc.def token=my-token password:hello "
@@ -191,6 +204,92 @@ class AlertGateTests(unittest.TestCase):
 
 
 class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_outbound_message_redacts_spaced_secret_without_erasing_context(self):
+        ctx = FakeContext()
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "on_exception",
+                "target_session": "synthetic:dm:test-target",
+                "message_template": "{component}|{error_type}|{summary}",
+                "cooldown_seconds": 0,
+            },
+        )
+        await plugin.initialize()
+        try:
+            await plugin.handle_exception(
+                None,
+                KiraExceptionEvent(
+                    name="APIError",
+                    message=(
+                        'request failed password="EN01_OUTBOUND TWO WORDS" '
+                        "code=503"
+                    ),
+                    source="provider",
+                    comp_id="provider-gateway",
+                    stage="agent_loop",
+                ),
+            )
+            await asyncio.wait_for(plugin._queue.join(), timeout=1)
+
+            content = ctx.sent[0][1]
+            self.assertNotIn("EN01_OUTBOUND", content)
+            self.assertNotIn("TWO WORDS", content)
+            self.assertIn("provider-gateway|APIError|request failed", content)
+            self.assertIn("code=503", content)
+        finally:
+            await plugin.terminate()
+
+    async def test_hidden_summary_keeps_type_and_component_readable(self):
+        ctx = FakeContext()
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "on_exception",
+                "target_session": "synthetic:dm:test-target",
+                "message_template": "{component}|{error_type}|{summary}",
+                "include_error_summary": False,
+                "cooldown_seconds": 0,
+            },
+        )
+        await plugin.initialize()
+        try:
+            await plugin.handle_exception(
+                None,
+                KiraExceptionEvent(
+                    name="APIError",
+                    message="password=EN01_HIDDEN_SECRET",
+                    source="provider",
+                    comp_id="provider-gateway",
+                    stage="agent_loop",
+                ),
+            )
+            await asyncio.wait_for(plugin._queue.join(), timeout=1)
+            self.assertEqual(
+                ctx.sent[0][1],
+                "provider-gateway|APIError|（已按配置隐藏）",
+            )
+        finally:
+            await plugin.terminate()
+
+    async def test_send_failure_log_redacts_adapter_error(self):
+        class FailedContext:
+            async def send_message_chain(self, _session, _chain):
+                return types.SimpleNamespace(
+                    ok=False,
+                    err="Authorization: Bearer EN01_LOG_SECRET",
+                )
+
+        plugin = PLUGIN.ErrorNotifierPlugin(FailedContext(), {})
+        with self.assertLogs(PLUGIN.NOTIFIER_LOGGER_NAME, level="ERROR") as logs:
+            await plugin._send_text("safe synthetic message")
+
+        output = "\n".join(logs.output)
+        self.assertNotIn("EN01_LOG_SECRET", output)
+        self.assertIn("Failed to send error notification", output)
+
     async def test_blacklisted_exception_is_not_sent(self):
         ctx = FakeContext()
         plugin = PLUGIN.ErrorNotifierPlugin(

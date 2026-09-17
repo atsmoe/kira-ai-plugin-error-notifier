@@ -1,0 +1,38 @@
+[
+  {
+    "name": "quoted spaced password",
+    "text": "APIError component=provider-gateway password=\"EN01_QUOTED TWO WORDS\" code=503",
+    "secrets": ["EN01_QUOTED", "TWO WORDS"],
+    "visible": ["APIError", "component=provider-gateway", "code=503"]
+  },
+  {
+    "name": "unquoted spaced password",
+    "text": "adapter failed password=EN01_UNQUOTED TWO WORDS component=qq-adapter",
+    "secrets": ["EN01_UNQUOTED", "TWO WORDS"],
+    "visible": ["adapter failed", "component=qq-adapter"]
+  },
+  {
+    "name": "authorization basic header",
+    "text": "upstream rejected Authorization: Basic EN01_BASIC_CREDENTIAL request failed",
+    "secrets": ["EN01_BASIC_CREDENTIAL"],
+    "visible": ["upstream rejected"]
+  },
+  {
+    "name": "bearer header",
+    "text": "request denied authorization=Bearer EN01_BEARER_CREDENTIAL",
+    "secrets": ["EN01_BEARER_CREDENTIAL"],
+    "visible": ["request denied"]
+  },
+  {
+    "name": "query parameter",
+    "text": "GET https://example.invalid/api?token=EN01_QUERY_SECRET&mode=retry failed",
+    "secrets": ["EN01_QUERY_SECRET"],
+    "visible": ["example.invalid", "mode=retry", "failed"]
+  },
+  {
+    "name": "url userinfo",
+    "text": "connect https://EN01_USER:EN01_URL_PASSWORD@example.invalid/api failed",
+    "secrets": ["EN01_USER", "EN01_URL_PASSWORD"],
+    "visible": ["example.invalid", "failed"]
+  }
+]

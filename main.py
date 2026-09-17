@@ -37,14 +37,33 @@ KiraAI 当前进程仍在运行。"""
 
 _notifier_logger = get_logger(NOTIFIER_LOGGER_NAME, "red")
 
-_SENSITIVE_VALUE_RE = re.compile(
-    r"(?i)(\b(?:api[_-]?key|token|secret|password|passkey|access[_-]?token|"
-    r"refresh[_-]?token|authorization)\b[\"']?\s*[:=]\s*)[\"']?[^\"',;\s}\]]+"
+_SENSITIVE_KEY_PATTERN = (
+    r"(?:api[_-]?key|token|secret|password|passkey|access[_-]?token|"
+    r"refresh[_-]?token)"
+)
+_QUOTED_SENSITIVE_VALUE_RE = re.compile(
+    rf"(?i)((?:[\"'])?\b{_SENSITIVE_KEY_PATTERN}\b(?:[\"'])?\s*[:=]\s*)"
+    r"(?P<quote>[\"'])(?P<value>.*?)(?P=quote)"
+)
+_UNTERMINATED_QUOTED_SENSITIVE_RE = re.compile(
+    rf"(?i)((?:[\"'])?\b{_SENSITIVE_KEY_PATTERN}\b(?:[\"'])?\s*[:=]\s*)"
+    r"[\"'][^\r\n]*$"
+)
+_UNQUOTED_SENSITIVE_VALUE_RE = re.compile(
+    rf"(?i)((?:[\"'])?\b{_SENSITIVE_KEY_PATTERN}\b(?:[\"'])?\s*[:=]\s*)"
+    r"(?![\"']|\[REDACTED\])"
+    r".*?"
+    r"(?=(?:\s+[A-Za-z_][\w.-]*\s*[:=])|[,;}\]]|$)"
+)
+_AUTH_HEADER_RE = re.compile(
+    r"(?i)(\b(?:authorization|proxy-authorization)\b\s*[:=]\s*)"
+    r"(?:(?:basic|bearer)\s+[^\s,;]+|[^\s,;]+)"
 )
 _BEARER_RE = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+")
 _URL_SECRET_RE = re.compile(
-    r"(?i)([?&](?:api[_-]?key|token|secret|password|passkey|access[_-]?token)=)[^&\s]+"
+    rf"(?i)([?&]{_SENSITIVE_KEY_PATTERN}=)[^&#\s]*"
 )
+_URL_USERINFO_RE = re.compile(r"(?i)(\b[a-z][a-z0-9+.-]*://)[^/@\s]+@")
 _LONG_ID_RE = re.compile(r"\b\d{8,20}\b")
 _TRACEBACK_FILE_RE = re.compile(r'^\s*File "[^"]+", line \d+', re.MULTILINE)
 _ISO_TIME_RE = re.compile(
@@ -63,11 +82,20 @@ _ZH_RETRY_RE = re.compile(r"第\s*\d+\s*次")
 
 
 def sanitize_text(value: object, max_chars: int = 400) -> str:
-    """Remove common credentials and compact a value for an outbound alert."""
+    """Redact credentials and compact a value for an outbound alert.
+
+    Quoted values retain surrounding diagnostic text. For an unmatched quote or
+    an unquoted value with no trustworthy next-field boundary, the remainder of
+    that line is conservatively redacted rather than risking a credential leak.
+    """
     text = str(value or "")
-    text = _BEARER_RE.sub(r"\1[REDACTED]", text)
-    text = _SENSITIVE_VALUE_RE.sub(r"\1[REDACTED]", text)
+    text = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", text)
     text = _URL_SECRET_RE.sub(r"\1[REDACTED]", text)
+    text = _AUTH_HEADER_RE.sub(r"\1[REDACTED]", text)
+    text = _BEARER_RE.sub(r"\1[REDACTED]", text)
+    text = _QUOTED_SENSITIVE_VALUE_RE.sub(r"\1[REDACTED]", text)
+    text = _UNTERMINATED_QUOTED_SENSITIVE_RE.sub(r"\1[REDACTED]", text)
+    text = _UNQUOTED_SENSITIVE_VALUE_RE.sub(r"\1[REDACTED]", text)
     text = _LONG_ID_RE.sub("[ID]", text)
     text = " ".join(text.split())
     if not text:
@@ -452,9 +480,15 @@ class ErrorNotifierPlugin(BasePlugin):
             )
             if not result or not getattr(result, "ok", False):
                 error = getattr(result, "err", "no result") if result else "no result"
-                _notifier_logger.error("Failed to send error notification: %s", error)
+                _notifier_logger.error(
+                    "Failed to send error notification: %s",
+                    summarize_error_text(error, 240),
+                )
         except Exception as exc:
-            _notifier_logger.error("Failed to send error notification: %s", exc)
+            _notifier_logger.error(
+                "Failed to send error notification: %s",
+                summarize_error_text(exc, 240),
+            )
         finally:
             self._sending_notification = False
 
