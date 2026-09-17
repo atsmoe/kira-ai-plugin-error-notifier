@@ -134,6 +134,19 @@ class MetadataTests(unittest.TestCase):
 
 
 class SanitizeTests(unittest.TestCase):
+    def test_client_secret_variants_use_common_redaction(self):
+        samples = (
+            "client_secret=SYNTH_CLIENT_SECRET component=gateway",
+            'CLIENT-SECRET="SYNTH CLIENT HYPHEN" component=gateway',
+            "clientSecret='SYNTH CLIENT CAMEL' component=gateway",
+        )
+
+        for raw in samples:
+            with self.subTest(raw=raw):
+                result = PLUGIN.sanitize_text(raw, 1000)
+                self.assertNotIn("SYNTH", result)
+                self.assertIn("component=gateway", result)
+
     def test_readable_compact_notifications(self):
         plugin = PLUGIN.ErrorNotifierPlugin(FakeContext(), {})
         cases = (
@@ -185,6 +198,31 @@ class SanitizeTests(unittest.TestCase):
             "private-component",
         ):
             self.assertNotIn(secret, content)
+
+    def test_compact_unknown_summary_removes_body_fields_and_unc_paths(self):
+        samples = (
+            ("failure client_secret=SYNTH_CLIENT_SECRET detail=bad", "SYNTH_CLIENT_SECRET", "failure"),
+            ("operation failed requestBody=SYNTH_REQUEST_CAMEL", "SYNTH_REQUEST_CAMEL", "operation failed"),
+            ("failure request_body=SYNTH_REQUEST_SECRET detail=bad", "SYNTH_REQUEST_SECRET", "failure"),
+            ("operation failed request-body=SYNTH_REQUEST_HYPHEN", "SYNTH_REQUEST_HYPHEN", "operation failed"),
+            ("failure responseBody=SYNTH_RESPONSE_SECRET detail=bad", "SYNTH_RESPONSE_SECRET", "failure"),
+            ("operation failed response_body=SYNTH_RESPONSE_SNAKE", "SYNTH_RESPONSE_SNAKE", "operation failed"),
+            ("operation failed response-body=SYNTH_RESPONSE_HYPHEN", "SYNTH_RESPONSE_HYPHEN", "operation failed"),
+            ('operation failed {"responseBody": "SYNTH_RESPONSE_JSON"}', "SYNTH_RESPONSE_JSON", "operation failed"),
+            ("operation failed {'request-body': 'SYNTH_REQUEST_DICT'}", "SYNTH_REQUEST_DICT", "operation failed"),
+            (r"failure \\server\share\private.txt detail=bad", r"\\server\share\private.txt", "failure"),
+        )
+        plugin = PLUGIN.ErrorNotifierPlugin(FakeContext(), {})
+
+        for raw, hidden, visible in samples:
+            with self.subTest(raw=raw):
+                alert = PLUGIN.Alert(
+                    "13:10", "tool", "component", "agent_loop", "Error", raw
+                )
+                content = plugin._render_message(alert, 0)
+                self.assertIn(visible, content)
+                self.assertNotIn(hidden, content)
+
 
     def test_authorization_shape_matrix_is_redacted_conservatively(self):
         samples = (
@@ -365,6 +403,22 @@ class AlertGateTests(unittest.TestCase):
 
 
 class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_failure_log_redacts_client_secret_variant(self):
+        class FailedContext:
+            async def send_message_chain(self, _session, _chain):
+                return types.SimpleNamespace(
+                    ok=False,
+                    err="adapter failed clientSecret=SYNTH_LOG_CLIENT_SECRET component=adapter",
+                )
+
+        plugin = PLUGIN.ErrorNotifierPlugin(FailedContext(), {})
+        with self.assertLogs(PLUGIN.NOTIFIER_LOGGER_NAME, level="ERROR") as logs:
+            await plugin._send_text("safe synthetic message")
+
+        output = "\n".join(logs.output)
+        self.assertNotIn("SYNTH_LOG_CLIENT_SECRET", output)
+        self.assertIn("component=adapter", output)
+
     async def test_compact_notification_is_default_and_omits_raw_payload(self):
         ctx = FakeContext()
         plugin = PLUGIN.ErrorNotifierPlugin(

@@ -42,7 +42,7 @@ KiraAI 当前进程仍在运行。"""
 _notifier_logger = get_logger(NOTIFIER_LOGGER_NAME, "red")
 
 _SENSITIVE_KEY_PATTERN = (
-    r"(?:api[_-]?key|token|secret|password|passkey|access[_-]?token|"
+    r"(?:api[_-]?key|token|client[_-]?secret|secret|password|passkey|access[_-]?token|"
     r"refresh[_-]?token)"
 )
 _SENSITIVE_ASSIGNMENT_RE = re.compile(
@@ -211,13 +211,15 @@ def readable_alert(alert: "Alert", include_summary: bool = True) -> tuple[str, s
 
     summary = summarize_error_text(alert.summary, 400)
     summary = re.sub(
-        r"(?i)\b(?:https?|wss?)://\S+|(?:[A-Za-z]:[\\/]|/)[^\s]+",
+        r"(?i)\b(?:https?|wss?)://\S+|(?:[A-Za-z]:[\\/]|/)[^\s]+|"
+        r"\\\\[^\s\\]+\\[^\s]+",
         "[已隐藏]",
         summary,
     )
     summary = re.split(
-        r"(?i)\b(?:authorization|cookie|password|token|secret|api[_-]?key|"
-        r"response|body|payload)\s*[:=]|[\{\[]",
+        r"(?i)\b(?:authorization|cookie|password|token|client[_-]?secret|"
+        r"secret|api[_-]?key|(?:request|response)[_-]?body|response|body|"
+        r"payload)[\"']?\s*[:=]|[\{\[]",
         summary,
         maxsplit=1,
     )[0].strip()
