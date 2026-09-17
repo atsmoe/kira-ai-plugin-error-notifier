@@ -98,6 +98,16 @@ def load_plugin_module():
 PLUGIN, KIRA_LOGGING, KiraExceptionEvent = load_plugin_module()
 
 
+def load_plugin_module_same_host(suffix):
+    """Load a fresh plugin module while retaining the synthetic KiraAI host."""
+    module_name = f"error_notifier_plugin_reload_{suffix}"
+    spec = importlib.util.spec_from_file_location(module_name, PLUGIN_ROOT / "main.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 class FakeResult:
     ok = True
     err = ""
@@ -113,6 +123,57 @@ class FakeContext:
 
 
 class SanitizeTests(unittest.TestCase):
+    def test_authorization_shape_matrix_is_redacted_conservatively(self):
+        samples = (
+            (
+                'Authorization: "Basic SYNTH_INSIDE_DOUBLE SECRET" component=gateway',
+                ("SYNTH_INSIDE_DOUBLE", "SECRET"),
+            ),
+            (
+                "Authorization: 'Bearer SYNTH_INSIDE_SINGLE TWO' component=gateway",
+                ("SYNTH_INSIDE_SINGLE", "TWO"),
+            ),
+            (
+                'Authorization: Basic "SYNTH_OUTSIDE_DOUBLE SECRET" component=gateway',
+                ("SYNTH_OUTSIDE_DOUBLE", "SECRET"),
+            ),
+            (
+                "Authorization: Bearer 'SYNTH_OUTSIDE_SINGLE TWO' component=gateway",
+                ("SYNTH_OUTSIDE_SINGLE", "TWO"),
+            ),
+            (
+                'headers={"Authorization": "Basic SYNTH_DICT_DOUBLE SECRET"} component=gateway',
+                ("SYNTH_DICT_DOUBLE", "SECRET"),
+            ),
+            (
+                "headers={'Proxy-Authorization': 'Bearer SYNTH_DICT_SINGLE TWO'} component=gateway",
+                ("SYNTH_DICT_SINGLE", "TWO"),
+            ),
+            (
+                'Authorization: Basic "SYNTH_MULTI\nLINE SECRET" component=gateway',
+                ("SYNTH_MULTI", "LINE SECRET"),
+            ),
+            (
+                'Authorization: Bearer "SYNTH_ESCAPED\\\"QUOTE SECRET" component=gateway',
+                ("SYNTH_ESCAPED", "QUOTE SECRET"),
+            ),
+            (
+                'headers={"Authorization": "Basic SYNTH_UNCLOSED\ncomponent=gateway',
+                ("SYNTH_UNCLOSED",),
+            ),
+            (
+                "Authorization: Bearer SYNTH_UNQUOTED TWO component=gateway",
+                ("SYNTH_UNQUOTED", "TWO"),
+            ),
+        )
+
+        for raw, secrets in samples:
+            with self.subTest(raw=raw):
+                result = PLUGIN.sanitize_text(raw, 1000)
+                for secret in secrets:
+                    self.assertNotIn(secret, result)
+                self.assertIn("component=gateway", result)
+
     def test_redacts_quoted_and_multiline_credential_edge_cases(self):
         samples = (
             (
@@ -241,6 +302,146 @@ class AlertGateTests(unittest.TestCase):
 
 
 class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_authorization_redaction_is_consistent_outbound_and_in_send_log(self):
+        class NegativeResultContext:
+            def __init__(self):
+                self.sent = []
+
+            async def send_message_chain(self, _session, chain):
+                self.sent.append(chain.text_value)
+                return types.SimpleNamespace(
+                    ok=False,
+                    err=(
+                        'adapter rejected Authorization: Bearer '
+                        '"SYNTH_LOG_SECRET TWO" component=qq-adapter'
+                    ),
+                )
+
+        ctx = NegativeResultContext()
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "on_exception",
+                "target_session": "synthetic:dm:test-target",
+                "message_template": "{component}|{error_type}|{summary}",
+                "cooldown_seconds": 0,
+            },
+        )
+        await plugin.initialize()
+        try:
+            with self.assertLogs(PLUGIN.NOTIFIER_LOGGER_NAME, level="ERROR") as logs:
+                await plugin.handle_exception(
+                    None,
+                    KiraExceptionEvent(
+                        name="SyntheticAuthError",
+                        message=(
+                            'headers={"Authorization": '
+                            '"Basic SYNTH_OUTBOUND_SECRET TWO"} detail=failed'
+                        ),
+                        source="provider",
+                        comp_id="provider-gateway",
+                        stage="agent_loop",
+                    ),
+                )
+                await asyncio.wait_for(plugin._queue.join(), timeout=0.5)
+
+            outbound = ctx.sent[0]
+            log_output = "\n".join(logs.output)
+            self.assertNotIn("SYNTH_OUTBOUND_SECRET", outbound)
+            self.assertNotIn("TWO", outbound)
+            self.assertIn("provider-gateway|SyntheticAuthError", outbound)
+            self.assertIn("detail=failed", outbound)
+            self.assertNotIn("SYNTH_LOG_SECRET", log_output)
+            self.assertNotIn("TWO", log_output)
+            self.assertIn("component=qq-adapter", log_output)
+        finally:
+            await plugin.terminate()
+
+    async def test_process_send_cap_survives_instances_and_module_reload(self):
+        class SharedCancellationSwallowingContext:
+            def __init__(self):
+                self.calls = 0
+                self.release = asyncio.Event()
+
+            async def send_message_chain(self, _session, _chain):
+                self.calls += 1
+                while not self.release.is_set():
+                    try:
+                        await self.release.wait()
+                    except asyncio.CancelledError:
+                        continue
+                return FakeResult()
+
+        modules = (
+            PLUGIN,
+            load_plugin_module_same_host("second"),
+            load_plugin_module_same_host("third"),
+        )
+        ctx = SharedCancellationSwallowingContext()
+        plugins = [
+            module.ErrorNotifierPlugin(
+                ctx,
+                {
+                    "enabled": True,
+                    "monitor_mode": "on_exception",
+                    "target_session": "synthetic:dm:test-target",
+                    "cooldown_seconds": 0,
+                    "send_timeout_seconds": 1,
+                },
+            )
+            for module in modules
+        ]
+        for plugin in plugins:
+            plugin.send_timeout_seconds = 0.03
+            await plugin.initialize()
+
+        try:
+            for plugin_index, plugin in enumerate(plugins):
+                for alert_index in range(3):
+                    await plugin.handle_exception(
+                        None,
+                        KiraExceptionEvent(
+                            name="APIError",
+                            message=f"reload {plugin_index} alert {alert_index}",
+                            source="provider",
+                            comp_id="provider-gateway",
+                            stage="agent_loop",
+                        ),
+                    )
+
+            await asyncio.wait_for(
+                asyncio.gather(*(plugin._queue.join() for plugin in plugins)),
+                timeout=0.4,
+            )
+
+            self.assertEqual(ctx.calls, 2)
+            self.assertEqual(sum(p.delivery_stats.attempted for p in plugins), 9)
+            self.assertEqual(sum(p.delivery_stats.failed for p in plugins), 9)
+            self.assertEqual(sum(p.delivery_stats.timed_out for p in plugins), 2)
+            self.assertEqual(sum(p.delivery_stats.saturated for p in plugins), 7)
+            for plugin in plugins:
+                self.assertEqual(plugin.process_pending_send_count, 2)
+
+            await asyncio.wait_for(
+                asyncio.gather(*(plugin.terminate() for plugin in plugins)),
+                timeout=0.1,
+            )
+            self.assertEqual(plugins[0].process_pending_send_count, 2)
+        finally:
+            ctx.release.set()
+            for _ in range(5):
+                await asyncio.sleep(0)
+                if all(
+                    getattr(plugin, "process_pending_send_count", plugin.pending_send_count)
+                    == 0
+                    for plugin in plugins
+                ):
+                    break
+            for plugin in plugins:
+                if plugin._active:
+                    await plugin.terminate()
+
     async def test_runtime_timeout_matches_integer_schema_boundary(self):
         below_minimum = PLUGIN.ErrorNotifierPlugin(
             FakeContext(),

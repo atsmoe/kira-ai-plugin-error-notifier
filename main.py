@@ -24,6 +24,7 @@ MODE_ALL_ERROR = "all_error"
 VALID_MODES = {MODE_ON_EXCEPTION, MODE_ALL_ERROR}
 NOTIFIER_LOGGER_NAME = "error_notifier"
 MAX_INFLIGHT_SENDS = 2
+_PROCESS_SEND_TASKS_ATTR = "_error_notifier_process_send_tasks"
 
 DEFAULT_MESSAGE_TEMPLATE = """【KiraAI 异常提醒】
 
@@ -47,12 +48,12 @@ _SENSITIVE_ASSIGNMENT_RE = re.compile(
     rf"(?i)(?:[\"'])?\b{_SENSITIVE_KEY_PATTERN}\b(?:[\"'])?\s*[:=]\s*"
 )
 _AUTH_HEADER_PREFIX_RE = re.compile(
-    r"(?i)\b(?:authorization|proxy-authorization)\b\s*[:=]\s*"
+    r"(?i)(?:[\"'])?\b(?:authorization|proxy-authorization)\b"
+    r"(?:[\"'])?\s*[:=]\s*"
 )
 _NEXT_FIELD_BOUNDARY_RE = re.compile(
     r"(?:\s+|[,;]\s*)(?=(?:[\"'])?[A-Za-z_][\w.-]*(?:[\"'])?\s*[:=])"
 )
-_AUTH_SCHEME_VALUE_RE = re.compile(r"(?i)(?:basic|bearer)\s+[^\s,;]+")
 _BEARER_RE = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+")
 _URL_SECRET_RE = re.compile(
     rf"(?i)([?&]{_SENSITIVE_KEY_PATTERN}=)[^&#\s]*"
@@ -119,12 +120,10 @@ def _redact_prefixed_values(
                 boundary = _NEXT_FIELD_BOUNDARY_RE.search(text, value_start + 1)
                 value_end = boundary.start() if boundary else len(text)
         elif authorization:
-            scheme_value = _AUTH_SCHEME_VALUE_RE.match(text, value_start)
-            if scheme_value:
-                value_end = scheme_value.end()
-            else:
-                boundary = _NEXT_FIELD_BOUNDARY_RE.search(text, value_start)
-                value_end = boundary.start() if boundary else len(text)
+            # An unquoted authorization value can contain a scheme, a quoted
+            # credential, or spaces. Whitespace alone is not a safe boundary.
+            boundary = _NEXT_FIELD_BOUNDARY_RE.search(text, value_start)
+            value_end = boundary.start() if boundary else len(text)
         else:
             boundary = _NEXT_FIELD_BOUNDARY_RE.search(text, value_start)
             value_end = boundary.start() if boundary else len(text)
@@ -134,6 +133,15 @@ def _redact_prefixed_values(
 
     output.append(text[position:])
     return "".join(output)
+
+
+def _get_process_send_tasks() -> set[asyncio.Task]:
+    """Return a host-owned registry that survives plugin module reloads."""
+    tasks = getattr(kira_logging, _PROCESS_SEND_TASKS_ATTR, None)
+    if not isinstance(tasks, set):
+        tasks = set()
+        setattr(kira_logging, _PROCESS_SEND_TASKS_ATTR, tasks)
+    return tasks
 
 
 def sanitize_text(value: object, max_chars: int = 400) -> str:
@@ -318,6 +326,7 @@ class ErrorNotifierPlugin(BasePlugin):
         self._active = False
         self._sending_notification = False
         self._send_tasks: set[asyncio.Task] = set()
+        self._process_send_tasks = _get_process_send_tasks()
         self._suppress_send_logs: ContextVar[bool] = ContextVar(
             f"{PLUGIN_ID}:suppress-send-logs", default=False
         )
@@ -579,7 +588,7 @@ class ErrorNotifierPlugin(BasePlugin):
 
     async def _send_text(self, content: str) -> bool:
         self.delivery_stats.attempted += 1
-        if self.pending_send_count >= MAX_INFLIGHT_SENDS:
+        if self.process_pending_send_count >= MAX_INFLIGHT_SENDS:
             self.delivery_stats.failed += 1
             self.delivery_stats.saturated += 1
             _notifier_logger.error(
@@ -592,6 +601,7 @@ class ErrorNotifierPlugin(BasePlugin):
             self._perform_send(content), name=f"{PLUGIN_ID}:send"
         )
         self._send_tasks.add(task)
+        self._process_send_tasks.add(task)
         task.add_done_callback(self._on_send_task_done)
         self._sending_notification = True
         try:
@@ -642,6 +652,10 @@ class ErrorNotifierPlugin(BasePlugin):
     def pending_send_count(self) -> int:
         return sum(not task.done() for task in self._send_tasks)
 
+    @property
+    def process_pending_send_count(self) -> int:
+        return sum(not task.done() for task in self._process_send_tasks)
+
     async def _perform_send(self, content: str):
         suppress_token = self._suppress_send_logs.set(True)
         try:
@@ -654,6 +668,7 @@ class ErrorNotifierPlugin(BasePlugin):
 
     def _on_send_task_done(self, task: asyncio.Task):
         self._send_tasks.discard(task)
+        self._process_send_tasks.discard(task)
         self._sending_notification = bool(self.pending_send_count)
         try:
             task.exception()
