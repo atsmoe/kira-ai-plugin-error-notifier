@@ -18,6 +18,14 @@
     "default": "",
     "hint": "格式：适配器实例名:dm:账号，例如 qq:dm:123456789。也支持 gm 群会话。"
   },
+  "send_timeout_seconds": {
+    "name": "发送超时（秒）",
+    "type": "integer",
+    "default": 15,
+    "minimum": 1,
+    "maximum": 300,
+    "hint": "单次通知发送的最长等待时间。超时会取消本次发送，worker 随后继续处理下一条。"
+  },
   "message_template": {
     "name": "通知内容模板",
     "type": "textarea",

@@ -7,6 +7,7 @@ import re
 import threading
 import time
 from collections import deque
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Callable, Optional
@@ -151,6 +152,16 @@ class Alert:
 
 
 @dataclass
+class DeliveryStats:
+    attempted: int = 0
+    delivered: int = 0
+    failed: int = 0
+    timed_out: int = 0
+    cancelled: int = 0
+    rate_limited: int = 0
+
+
+@dataclass
 class _GateEntry:
     last_sent: float = float("-inf")
     last_seen: float = 0.0
@@ -226,6 +237,9 @@ class ErrorNotifierPlugin(BasePlugin):
             self.monitor_mode = MODE_ON_EXCEPTION
 
         self.target_session = str(cfg.get("target_session", "")).strip()
+        self.send_timeout_seconds = self._as_float(
+            cfg.get("send_timeout_seconds", 15), 15.0, 0.1, 300.0
+        )
         self.message_template = str(
             cfg.get("message_template", DEFAULT_MESSAGE_TEMPLATE)
             or DEFAULT_MESSAGE_TEMPLATE
@@ -250,6 +264,10 @@ class ErrorNotifierPlugin(BasePlugin):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._active = False
         self._sending_notification = False
+        self._suppress_send_logs: ContextVar[bool] = ContextVar(
+            f"{PLUGIN_ID}:suppress-send-logs", default=False
+        )
+        self.delivery_stats = DeliveryStats()
         self._dropped_alerts = 0
         self._pending_log_callbacks = 0
         self._pending_log_callbacks_limit = 100
@@ -259,6 +277,16 @@ class ErrorNotifierPlugin(BasePlugin):
     def _as_int(value: object, default: int, minimum: int, maximum: int) -> int:
         try:
             parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return min(max(parsed, minimum), maximum)
+
+    @staticmethod
+    def _as_float(
+        value: object, default: float, minimum: float, maximum: float
+    ) -> float:
+        try:
+            parsed = float(value)
         except (TypeError, ValueError):
             parsed = default
         return min(max(parsed, minimum), maximum)
@@ -337,9 +365,27 @@ class ErrorNotifierPlugin(BasePlugin):
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
 
+        discarded = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                self._queue.task_done()
+                discarded += 1
+        if discarded:
+            with self._pending_lock:
+                self._dropped_alerts += discarded
+
+        await asyncio.sleep(0)
+        with self._pending_lock:
+            self._pending_log_callbacks = 0
+
         self._scanner_task = None
         self._worker_task = None
         self._loop = None
+        self._sending_notification = False
         _notifier_logger.info("Error notifier terminated")
 
     @on.exception(priority=Priority.LOW)
@@ -372,7 +418,7 @@ class ErrorNotifierPlugin(BasePlugin):
         if (
             not self._active
             or self.monitor_mode != MODE_ALL_ERROR
-            or self._sending_notification
+            or self._suppress_send_logs.get()
             or not self._loop
             or self._loop.is_closed()
         ):
@@ -444,6 +490,8 @@ class ErrorNotifierPlugin(BasePlugin):
                 allowed, repeat_count = self._gate.check(alert.fingerprint)
                 if allowed:
                     await self._send_text(self._render_message(alert, repeat_count))
+                else:
+                    self.delivery_stats.rate_limited += 1
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -471,25 +519,49 @@ class ErrorNotifierPlugin(BasePlugin):
             )
             return DEFAULT_MESSAGE_TEMPLATE.format_map(values)
 
-    async def _send_text(self, content: str):
+    async def _send_text(self, content: str) -> bool:
+        self.delivery_stats.attempted += 1
         self._sending_notification = True
+        suppress_token = self._suppress_send_logs.set(True)
         try:
-            result = await self.ctx.send_message_chain(
-                self.target_session,
-                MessageChain().text(content),
+            result = await asyncio.wait_for(
+                self.ctx.send_message_chain(
+                    self.target_session,
+                    MessageChain().text(content),
+                ),
+                timeout=self.send_timeout_seconds,
             )
             if not result or not getattr(result, "ok", False):
+                self.delivery_stats.failed += 1
                 error = getattr(result, "err", "no result") if result else "no result"
                 _notifier_logger.error(
                     "Failed to send error notification: %s",
                     summarize_error_text(error, 240),
                 )
+                return False
+            self.delivery_stats.delivered += 1
+            _notifier_logger.info("Error notification delivered")
+            return True
+        except asyncio.TimeoutError:
+            self.delivery_stats.failed += 1
+            self.delivery_stats.timed_out += 1
+            _notifier_logger.error(
+                "Error notification delivery timed out after %.2f seconds",
+                self.send_timeout_seconds,
+            )
+            return False
+        except asyncio.CancelledError:
+            self.delivery_stats.cancelled += 1
+            raise
         except Exception as exc:
+            self.delivery_stats.failed += 1
             _notifier_logger.error(
                 "Failed to send error notification: %s",
                 summarize_error_text(exc, 240),
             )
+            return False
         finally:
+            self._suppress_send_logs.reset(suppress_token)
             self._sending_notification = False
 
     async def _logger_scanner(self):

@@ -204,6 +204,262 @@ class AlertGateTests(unittest.TestCase):
 
 
 class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_timeout_recovers_worker_and_counts_real_outcomes(self):
+        class TimeoutThenSuccessContext:
+            def __init__(self):
+                self.calls = []
+                self.first_started = asyncio.Event()
+                self.first_cancelled = asyncio.Event()
+
+            async def send_message_chain(self, _session, chain):
+                self.calls.append(chain.text_value)
+                if len(self.calls) == 1:
+                    self.first_started.set()
+                    try:
+                        await asyncio.Event().wait()
+                    finally:
+                        self.first_cancelled.set()
+                return FakeResult()
+
+        ctx = TimeoutThenSuccessContext()
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "on_exception",
+                "target_session": "synthetic:dm:test-target",
+                "cooldown_seconds": 0,
+                "send_timeout_seconds": 1,
+            },
+        )
+        plugin.send_timeout_seconds = 0.03
+        await plugin.initialize()
+        try:
+            for index in range(2):
+                await plugin.handle_exception(
+                    None,
+                    KiraExceptionEvent(
+                        name="APIError",
+                        message=f"synthetic timeout sequence {index}",
+                        source="provider",
+                        comp_id="provider-gateway",
+                        stage="agent_loop",
+                    ),
+                )
+            await asyncio.wait_for(plugin._queue.join(), timeout=0.5)
+
+            self.assertTrue(ctx.first_cancelled.is_set())
+            self.assertEqual(len(ctx.calls), 2)
+            self.assertEqual(plugin.delivery_stats.attempted, 2)
+            self.assertEqual(plugin.delivery_stats.failed, 1)
+            self.assertEqual(plugin.delivery_stats.timed_out, 1)
+            self.assertEqual(plugin.delivery_stats.delivered, 1)
+        finally:
+            await plugin.terminate()
+
+    async def test_exception_and_negative_result_do_not_retry_or_block_next_item(self):
+        class FailureSequenceContext:
+            def __init__(self):
+                self.calls = 0
+
+            async def send_message_chain(self, _session, _chain):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("password=EN02_EXCEPTION_SECRET")
+                if self.calls == 2:
+                    return types.SimpleNamespace(
+                        ok=False,
+                        err="Authorization: Bearer EN02_RESULT_SECRET",
+                    )
+                return FakeResult()
+
+        ctx = FailureSequenceContext()
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "on_exception",
+                "target_session": "synthetic:dm:test-target",
+                "cooldown_seconds": 0,
+            },
+        )
+        await plugin.initialize()
+        try:
+            with self.assertLogs(PLUGIN.NOTIFIER_LOGGER_NAME, level="ERROR") as logs:
+                for index in range(3):
+                    await plugin.handle_exception(
+                        None,
+                        KiraExceptionEvent(
+                            name="APIError",
+                            message=f"synthetic failure sequence {index}",
+                            source="provider",
+                            comp_id="provider-gateway",
+                            stage="agent_loop",
+                        ),
+                    )
+                await asyncio.wait_for(plugin._queue.join(), timeout=0.5)
+
+            output = "\n".join(logs.output)
+            self.assertNotIn("EN02_EXCEPTION_SECRET", output)
+            self.assertNotIn("EN02_RESULT_SECRET", output)
+            self.assertEqual(ctx.calls, 3)
+            self.assertEqual(plugin.delivery_stats.attempted, 3)
+            self.assertEqual(plugin.delivery_stats.failed, 2)
+            self.assertEqual(plugin.delivery_stats.delivered, 1)
+        finally:
+            await plugin.terminate()
+
+    async def test_concurrent_business_error_is_retained_without_send_recursion(self):
+        business_logger = logging.getLogger("source_for_concurrent_business_error")
+        adapter_logger = logging.getLogger("source_for_synthetic_adapter_error")
+        for logger in (business_logger, adapter_logger):
+            logger.handlers.clear()
+            logger.setLevel(logging.DEBUG)
+            logger.propagate = False
+            KIRA_LOGGING._created_by_get_logger.add(logger.name)
+
+        class BlockingContext:
+            def __init__(self):
+                self.calls = []
+                self.started = asyncio.Event()
+
+            async def send_message_chain(self, _session, chain):
+                self.calls.append(chain.text_value)
+                if len(self.calls) == 1:
+                    self.started.set()
+                    adapter_logger.error(
+                        "synthetic adapter send failure password=EN02_RECURSION_SECRET"
+                    )
+                    await asyncio.Event().wait()
+                return FakeResult()
+
+        ctx = BlockingContext()
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "all_error",
+                "target_session": "synthetic:dm:test-target",
+                "cooldown_seconds": 0,
+                "send_timeout_seconds": 1,
+            },
+        )
+        plugin.send_timeout_seconds = 0.03
+        await plugin.initialize()
+        try:
+            business_logger.error("first synthetic business error")
+            await asyncio.wait_for(ctx.started.wait(), timeout=0.2)
+            business_logger.error("second concurrent business error")
+            await asyncio.sleep(0)
+            await asyncio.wait_for(plugin._queue.join(), timeout=0.5)
+
+            self.assertEqual(len(ctx.calls), 2)
+            self.assertIn("first synthetic business error", ctx.calls[0])
+            self.assertIn("second concurrent business error", ctx.calls[1])
+            self.assertFalse(any("EN02_RECURSION_SECRET" in call for call in ctx.calls))
+            self.assertEqual(plugin._dropped_alerts, 0)
+            self.assertEqual(plugin.delivery_stats.attempted, 2)
+            self.assertEqual(plugin.delivery_stats.failed, 1)
+            self.assertEqual(plugin.delivery_stats.delivered, 1)
+        finally:
+            await plugin.terminate()
+            for logger in (business_logger, adapter_logger):
+                KIRA_LOGGING._created_by_get_logger.discard(logger.name)
+                logger.handlers.clear()
+
+    async def test_policy_limit_is_not_counted_as_attempt_or_delivery(self):
+        ctx = FakeContext()
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "on_exception",
+                "target_session": "synthetic:dm:test-target",
+                "cooldown_seconds": 0,
+                "max_alerts_per_hour": 1,
+            },
+        )
+        await plugin.initialize()
+        try:
+            for index in range(2):
+                await plugin.handle_exception(
+                    None,
+                    KiraExceptionEvent(
+                        name="APIError",
+                        message=f"synthetic rate limit item {index}",
+                        source="provider",
+                        comp_id="provider-gateway",
+                        stage="agent_loop",
+                    ),
+                )
+            await asyncio.wait_for(plugin._queue.join(), timeout=0.5)
+
+            self.assertEqual(len(ctx.sent), 1)
+            self.assertEqual(plugin.delivery_stats.rate_limited, 1)
+            self.assertEqual(plugin.delivery_stats.attempted, 1)
+            self.assertEqual(plugin.delivery_stats.delivered, 1)
+        finally:
+            await plugin.terminate()
+
+    async def test_terminate_cancels_inflight_send_and_clears_state(self):
+        class BlockingContext:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.cancelled = asyncio.Event()
+
+            async def send_message_chain(self, _session, _chain):
+                self.started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    self.cancelled.set()
+
+        ctx = BlockingContext()
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "on_exception",
+                "target_session": "synthetic:dm:test-target",
+                "cooldown_seconds": 0,
+                "send_timeout_seconds": 30,
+            },
+        )
+        await plugin.initialize()
+        await plugin.handle_exception(
+            None,
+            KiraExceptionEvent(
+                name="APIError",
+                message="synthetic termination item",
+                source="provider",
+                comp_id="provider-gateway",
+                stage="agent_loop",
+            ),
+        )
+        await asyncio.wait_for(ctx.started.wait(), timeout=0.2)
+        await plugin.handle_exception(
+            None,
+            KiraExceptionEvent(
+                name="APIError",
+                message="synthetic queued termination item",
+                source="provider",
+                comp_id="provider-gateway",
+                stage="agent_loop",
+            ),
+        )
+
+        await asyncio.wait_for(plugin.terminate(), timeout=0.2)
+        await asyncio.wait_for(plugin._queue.join(), timeout=0.2)
+
+        self.assertTrue(ctx.cancelled.is_set())
+        self.assertFalse(plugin._active)
+        self.assertFalse(plugin._sending_notification)
+        self.assertIsNone(plugin._worker_task)
+        self.assertIsNone(plugin._scanner_task)
+        self.assertEqual(plugin._pending_log_callbacks, 0)
+        self.assertTrue(plugin._queue.empty())
+        self.assertEqual(plugin._dropped_alerts, 1)
+
     async def test_outbound_message_redacts_spaced_secret_without_erasing_context(self):
         ctx = FakeContext()
         plugin = PLUGIN.ErrorNotifierPlugin(
