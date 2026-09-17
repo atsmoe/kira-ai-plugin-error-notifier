@@ -23,6 +23,7 @@ MODE_ON_EXCEPTION = "on_exception"
 MODE_ALL_ERROR = "all_error"
 VALID_MODES = {MODE_ON_EXCEPTION, MODE_ALL_ERROR}
 NOTIFIER_LOGGER_NAME = "error_notifier"
+MAX_INFLIGHT_SENDS = 2
 
 DEFAULT_MESSAGE_TEMPLATE = """【KiraAI 异常提醒】
 
@@ -42,24 +43,16 @@ _SENSITIVE_KEY_PATTERN = (
     r"(?:api[_-]?key|token|secret|password|passkey|access[_-]?token|"
     r"refresh[_-]?token)"
 )
-_QUOTED_SENSITIVE_VALUE_RE = re.compile(
-    rf"(?i)((?:[\"'])?\b{_SENSITIVE_KEY_PATTERN}\b(?:[\"'])?\s*[:=]\s*)"
-    r"(?P<quote>[\"'])(?P<value>.*?)(?P=quote)"
+_SENSITIVE_ASSIGNMENT_RE = re.compile(
+    rf"(?i)(?:[\"'])?\b{_SENSITIVE_KEY_PATTERN}\b(?:[\"'])?\s*[:=]\s*"
 )
-_UNTERMINATED_QUOTED_SENSITIVE_RE = re.compile(
-    rf"(?i)((?:[\"'])?\b{_SENSITIVE_KEY_PATTERN}\b(?:[\"'])?\s*[:=]\s*)"
-    r"[\"'][^\r\n]*$"
+_AUTH_HEADER_PREFIX_RE = re.compile(
+    r"(?i)\b(?:authorization|proxy-authorization)\b\s*[:=]\s*"
 )
-_UNQUOTED_SENSITIVE_VALUE_RE = re.compile(
-    rf"(?i)((?:[\"'])?\b{_SENSITIVE_KEY_PATTERN}\b(?:[\"'])?\s*[:=]\s*)"
-    r"(?![\"']|\[REDACTED\])"
-    r".*?"
-    r"(?=(?:\s+[A-Za-z_][\w.-]*\s*[:=])|[,;}\]]|$)"
+_NEXT_FIELD_BOUNDARY_RE = re.compile(
+    r"(?:\s+|[,;]\s*)(?=(?:[\"'])?[A-Za-z_][\w.-]*(?:[\"'])?\s*[:=])"
 )
-_AUTH_HEADER_RE = re.compile(
-    r"(?i)(\b(?:authorization|proxy-authorization)\b\s*[:=]\s*)"
-    r"(?:(?:basic|bearer)\s+[^\s,;]+|[^\s,;]+)"
-)
+_AUTH_SCHEME_VALUE_RE = re.compile(r"(?i)(?:basic|bearer)\s+[^\s,;]+")
 _BEARER_RE = re.compile(r"(?i)(\bbearer\s+)[A-Za-z0-9._~+/=-]+")
 _URL_SECRET_RE = re.compile(
     rf"(?i)([?&]{_SENSITIVE_KEY_PATTERN}=)[^&#\s]*"
@@ -82,21 +75,80 @@ _RETRY_NUMBER_RE = re.compile(
 _ZH_RETRY_RE = re.compile(r"第\s*\d+\s*次")
 
 
+def _closing_quote_index(text: str, start: int, quote: str) -> Optional[int]:
+    """Find an unescaped matching quote, including across line breaks."""
+    index = start
+    while index < len(text):
+        if text[index] == quote:
+            backslashes = 0
+            cursor = index - 1
+            while cursor >= start and text[cursor] == "\\":
+                backslashes += 1
+                cursor -= 1
+            if backslashes % 2 == 0:
+                return index
+        index += 1
+    return None
+
+
+def _redact_prefixed_values(
+    text: str, prefix_pattern: re.Pattern[str], *, authorization: bool = False
+) -> str:
+    """Redact values after structured prefixes without trusting whitespace alone."""
+    output: list[str] = []
+    position = 0
+    while match := prefix_pattern.search(text, position):
+        output.append(text[position : match.end()])
+        value_start = match.end()
+        if text.startswith("[REDACTED]", value_start):
+            output.append("[REDACTED]")
+            position = value_start + len("[REDACTED]")
+            continue
+
+        if value_start >= len(text):
+            output.append("[REDACTED]")
+            position = value_start
+            break
+
+        quote = text[value_start] if text[value_start] in {'"', "'"} else ""
+        if quote:
+            closing_index = _closing_quote_index(text, value_start + 1, quote)
+            if closing_index is not None:
+                value_end = closing_index + 1
+            else:
+                boundary = _NEXT_FIELD_BOUNDARY_RE.search(text, value_start + 1)
+                value_end = boundary.start() if boundary else len(text)
+        elif authorization:
+            scheme_value = _AUTH_SCHEME_VALUE_RE.match(text, value_start)
+            if scheme_value:
+                value_end = scheme_value.end()
+            else:
+                boundary = _NEXT_FIELD_BOUNDARY_RE.search(text, value_start)
+                value_end = boundary.start() if boundary else len(text)
+        else:
+            boundary = _NEXT_FIELD_BOUNDARY_RE.search(text, value_start)
+            value_end = boundary.start() if boundary else len(text)
+
+        output.append("[REDACTED]")
+        position = value_end
+
+    output.append(text[position:])
+    return "".join(output)
+
+
 def sanitize_text(value: object, max_chars: int = 400) -> str:
     """Redact credentials and compact a value for an outbound alert.
 
     Quoted values retain surrounding diagnostic text. For an unmatched quote or
     an unquoted value with no trustworthy next-field boundary, the remainder of
-    that line is conservatively redacted rather than risking a credential leak.
+    the summary is conservatively redacted rather than risking a credential leak.
     """
     text = str(value or "")
     text = _URL_USERINFO_RE.sub(r"\1[REDACTED]@", text)
     text = _URL_SECRET_RE.sub(r"\1[REDACTED]", text)
-    text = _AUTH_HEADER_RE.sub(r"\1[REDACTED]", text)
+    text = _redact_prefixed_values(text, _AUTH_HEADER_PREFIX_RE, authorization=True)
     text = _BEARER_RE.sub(r"\1[REDACTED]", text)
-    text = _QUOTED_SENSITIVE_VALUE_RE.sub(r"\1[REDACTED]", text)
-    text = _UNTERMINATED_QUOTED_SENSITIVE_RE.sub(r"\1[REDACTED]", text)
-    text = _UNQUOTED_SENSITIVE_VALUE_RE.sub(r"\1[REDACTED]", text)
+    text = _redact_prefixed_values(text, _SENSITIVE_ASSIGNMENT_RE)
     text = _LONG_ID_RE.sub("[ID]", text)
     text = " ".join(text.split())
     if not text:
@@ -159,6 +211,7 @@ class DeliveryStats:
     timed_out: int = 0
     cancelled: int = 0
     rate_limited: int = 0
+    saturated: int = 0
 
 
 @dataclass
@@ -237,8 +290,8 @@ class ErrorNotifierPlugin(BasePlugin):
             self.monitor_mode = MODE_ON_EXCEPTION
 
         self.target_session = str(cfg.get("target_session", "")).strip()
-        self.send_timeout_seconds = self._as_float(
-            cfg.get("send_timeout_seconds", 15), 15.0, 0.1, 300.0
+        self.send_timeout_seconds = self._as_int(
+            cfg.get("send_timeout_seconds", 15), 15, 1, 300
         )
         self.message_template = str(
             cfg.get("message_template", DEFAULT_MESSAGE_TEMPLATE)
@@ -264,6 +317,7 @@ class ErrorNotifierPlugin(BasePlugin):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._active = False
         self._sending_notification = False
+        self._send_tasks: set[asyncio.Task] = set()
         self._suppress_send_logs: ContextVar[bool] = ContextVar(
             f"{PLUGIN_ID}:suppress-send-logs", default=False
         )
@@ -277,16 +331,6 @@ class ErrorNotifierPlugin(BasePlugin):
     def _as_int(value: object, default: int, minimum: int, maximum: int) -> int:
         try:
             parsed = int(value)
-        except (TypeError, ValueError):
-            parsed = default
-        return min(max(parsed, minimum), maximum)
-
-    @staticmethod
-    def _as_float(
-        value: object, default: float, minimum: float, maximum: float
-    ) -> float:
-        try:
-            parsed = float(value)
         except (TypeError, ValueError):
             parsed = default
         return min(max(parsed, minimum), maximum)
@@ -364,6 +408,20 @@ class ErrorNotifierPlugin(BasePlugin):
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+
+        for task in tuple(self._send_tasks):
+            task.cancel()
+        # Give cooperative adapters one event-loop turn to finish cancellation.
+        # Non-cooperative adapters remain detached and capped; termination never
+        # waits on code that ignores cancellation.
+        await asyncio.sleep(0)
+        unresolved_sends = self.pending_send_count
+        if unresolved_sends:
+            _notifier_logger.warning(
+                "Error notifier terminated with unresolved sends=%s; "
+                "their delivery outcome is unknown",
+                unresolved_sends,
+            )
 
         discarded = 0
         while True:
@@ -521,16 +579,40 @@ class ErrorNotifierPlugin(BasePlugin):
 
     async def _send_text(self, content: str) -> bool:
         self.delivery_stats.attempted += 1
+        if self.pending_send_count >= MAX_INFLIGHT_SENDS:
+            self.delivery_stats.failed += 1
+            self.delivery_stats.saturated += 1
+            _notifier_logger.error(
+                "Error notification not started: unresolved send limit reached (%s)",
+                MAX_INFLIGHT_SENDS,
+            )
+            return False
+
+        task = asyncio.create_task(
+            self._perform_send(content), name=f"{PLUGIN_ID}:send"
+        )
+        self._send_tasks.add(task)
+        task.add_done_callback(self._on_send_task_done)
         self._sending_notification = True
-        suppress_token = self._suppress_send_logs.set(True)
         try:
-            result = await asyncio.wait_for(
-                self.ctx.send_message_chain(
-                    self.target_session,
-                    MessageChain().text(content),
-                ),
+            done, _pending = await asyncio.wait(
+                {task},
                 timeout=self.send_timeout_seconds,
             )
+            if not done:
+                self.delivery_stats.failed += 1
+                self.delivery_stats.timed_out += 1
+                task.cancel()
+                await asyncio.sleep(0)
+                _notifier_logger.error(
+                    "Error notification delivery timed out after %.2f seconds; "
+                    "delivery outcome is unknown, unresolved sends=%s",
+                    self.send_timeout_seconds,
+                    self.pending_send_count,
+                )
+                return False
+
+            result = task.result()
             if not result or not getattr(result, "ok", False):
                 self.delivery_stats.failed += 1
                 error = getattr(result, "err", "no result") if result else "no result"
@@ -542,15 +624,8 @@ class ErrorNotifierPlugin(BasePlugin):
             self.delivery_stats.delivered += 1
             _notifier_logger.info("Error notification delivered")
             return True
-        except asyncio.TimeoutError:
-            self.delivery_stats.failed += 1
-            self.delivery_stats.timed_out += 1
-            _notifier_logger.error(
-                "Error notification delivery timed out after %.2f seconds",
-                self.send_timeout_seconds,
-            )
-            return False
         except asyncio.CancelledError:
+            task.cancel()
             self.delivery_stats.cancelled += 1
             raise
         except Exception as exc:
@@ -561,8 +636,29 @@ class ErrorNotifierPlugin(BasePlugin):
             )
             return False
         finally:
+            self._sending_notification = bool(self.pending_send_count)
+
+    @property
+    def pending_send_count(self) -> int:
+        return sum(not task.done() for task in self._send_tasks)
+
+    async def _perform_send(self, content: str):
+        suppress_token = self._suppress_send_logs.set(True)
+        try:
+            return await self.ctx.send_message_chain(
+                self.target_session,
+                MessageChain().text(content),
+            )
+        finally:
             self._suppress_send_logs.reset(suppress_token)
-            self._sending_notification = False
+
+    def _on_send_task_done(self, task: asyncio.Task):
+        self._send_tasks.discard(task)
+        self._sending_notification = bool(self.pending_send_count)
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
 
     async def _logger_scanner(self):
         while True:

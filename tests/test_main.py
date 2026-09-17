@@ -113,6 +113,43 @@ class FakeContext:
 
 
 class SanitizeTests(unittest.TestCase):
+    def test_redacts_quoted_and_multiline_credential_edge_cases(self):
+        samples = (
+            (
+                'Authorization: "Basic SYNTH_BASIC_SECRET" request failed',
+                ("SYNTH_BASIC_SECRET",),
+                ("request failed",),
+            ),
+            (
+                'Authorization: "Bearer SYNTH_BEARER TWO_WORDS" code=401',
+                ("SYNTH_BEARER", "TWO_WORDS"),
+                ("code=401",),
+            ),
+            (
+                'password="SYNTH_MULTILINE_SECRET\nnext=visible',
+                ("SYNTH_MULTILINE_SECRET",),
+                ("next=visible",),
+            ),
+            (
+                'password="SYNTH_CLOSED\nMULTILINE_SECRET" next=visible',
+                ("SYNTH_CLOSED", "MULTILINE_SECRET"),
+                ("next=visible",),
+            ),
+            (
+                'password="SYNTH_ESCAPED\\\"QUOTE SECRET" next=visible',
+                ("SYNTH_ESCAPED", "QUOTE SECRET"),
+                ("next=visible",),
+            ),
+        )
+
+        for raw, secrets, visible_values in samples:
+            with self.subTest(raw=raw):
+                result = PLUGIN.sanitize_text(raw, 1000)
+                for secret in secrets:
+                    self.assertNotIn(secret, result)
+                for visible in visible_values:
+                    self.assertIn(visible, result)
+
     def test_synthetic_sensitive_samples_are_redacted_and_readable(self):
         samples_path = PLUGIN_ROOT / "tests" / "fixtures" / "sensitive_alert_samples.json"
         samples = json.loads(samples_path.read_text(encoding="utf-8"))
@@ -204,6 +241,86 @@ class AlertGateTests(unittest.TestCase):
 
 
 class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runtime_timeout_matches_integer_schema_boundary(self):
+        below_minimum = PLUGIN.ErrorNotifierPlugin(
+            FakeContext(),
+            {
+                "enabled": True,
+                "target_session": "synthetic:dm:test-target",
+                "send_timeout_seconds": 0.1,
+            },
+        )
+        fractional = PLUGIN.ErrorNotifierPlugin(
+            FakeContext(),
+            {
+                "enabled": True,
+                "target_session": "synthetic:dm:test-target",
+                "send_timeout_seconds": 1.9,
+            },
+        )
+
+        self.assertEqual(below_minimum.send_timeout_seconds, 1)
+        self.assertEqual(fractional.send_timeout_seconds, 1)
+
+    async def test_non_cooperative_cancellation_is_bounded_and_worker_keeps_draining(self):
+        class CancellationSwallowingContext:
+            def __init__(self):
+                self.calls = 0
+                self.release = asyncio.Event()
+
+            async def send_message_chain(self, _session, _chain):
+                self.calls += 1
+                while not self.release.is_set():
+                    try:
+                        await self.release.wait()
+                    except asyncio.CancelledError:
+                        continue
+                return FakeResult()
+
+        ctx = CancellationSwallowingContext()
+        plugin = PLUGIN.ErrorNotifierPlugin(
+            ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "on_exception",
+                "target_session": "synthetic:dm:test-target",
+                "cooldown_seconds": 0,
+                "send_timeout_seconds": 1,
+            },
+        )
+        plugin.send_timeout_seconds = 0.03
+        await plugin.initialize()
+        try:
+            for index in range(3):
+                await plugin.handle_exception(
+                    None,
+                    KiraExceptionEvent(
+                        name="APIError",
+                        message=f"synthetic non-cooperative send {index}",
+                        source="provider",
+                        comp_id="provider-gateway",
+                        stage="agent_loop",
+                    ),
+                )
+
+            await asyncio.wait_for(plugin._queue.join(), timeout=0.3)
+
+            self.assertEqual(ctx.calls, 2)
+            self.assertEqual(plugin.delivery_stats.attempted, 3)
+            self.assertEqual(plugin.delivery_stats.failed, 3)
+            self.assertEqual(plugin.delivery_stats.timed_out, 2)
+            self.assertEqual(plugin.delivery_stats.saturated, 1)
+            self.assertEqual(plugin.pending_send_count, 2)
+            await asyncio.wait_for(plugin.terminate(), timeout=0.1)
+            self.assertEqual(plugin.pending_send_count, 2)
+            self.assertFalse(plugin._sending_notification)
+            self.assertIsNone(plugin._worker_task)
+        finally:
+            ctx.release.set()
+            await asyncio.sleep(0)
+            if plugin._active:
+                await plugin.terminate()
+
     async def test_send_timeout_recovers_worker_and_counts_real_outcomes(self):
         class TimeoutThenSuccessContext:
             def __init__(self):
