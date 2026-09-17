@@ -25,6 +25,7 @@ VALID_MODES = {MODE_ON_EXCEPTION, MODE_ALL_ERROR}
 NOTIFIER_LOGGER_NAME = "error_notifier"
 MAX_INFLIGHT_SENDS = 2
 _PROCESS_SEND_TASKS_ATTR = "_error_notifier_process_send_tasks"
+_PROCESS_SUPPRESS_CONTEXT_ATTR = "_error_notifier_suppress_send_logs"
 
 DEFAULT_MESSAGE_TEMPLATE = """【KiraAI 异常提醒】
 
@@ -142,6 +143,15 @@ def _get_process_send_tasks() -> set[asyncio.Task]:
         tasks = set()
         setattr(kira_logging, _PROCESS_SEND_TASKS_ATTR, tasks)
     return tasks
+
+
+def _get_process_suppress_send_logs() -> ContextVar[bool]:
+    """Return a task-local marker shared by every plugin module generation."""
+    marker = getattr(kira_logging, _PROCESS_SUPPRESS_CONTEXT_ATTR, None)
+    if not isinstance(marker, ContextVar):
+        marker = ContextVar(f"{PLUGIN_ID}:suppress-send-logs", default=False)
+        setattr(kira_logging, _PROCESS_SUPPRESS_CONTEXT_ATTR, marker)
+    return marker
 
 
 def sanitize_text(value: object, max_chars: int = 400) -> str:
@@ -327,9 +337,7 @@ class ErrorNotifierPlugin(BasePlugin):
         self._sending_notification = False
         self._send_tasks: set[asyncio.Task] = set()
         self._process_send_tasks = _get_process_send_tasks()
-        self._suppress_send_logs: ContextVar[bool] = ContextVar(
-            f"{PLUGIN_ID}:suppress-send-logs", default=False
-        )
+        self._suppress_send_logs = _get_process_suppress_send_logs()
         self.delivery_stats = DeliveryStats()
         self._dropped_alerts = 0
         self._pending_log_callbacks = 0

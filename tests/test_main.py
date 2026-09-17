@@ -302,6 +302,120 @@ class AlertGateTests(unittest.TestCase):
 
 
 class PluginAsyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_send_log_suppression_survives_module_reload_without_global_silence(self):
+        adapter_logger = logging.getLogger("source_for_reload_adapter_error")
+        business_logger = logging.getLogger("source_for_reload_business_error")
+        for logger in (adapter_logger, business_logger):
+            logger.handlers.clear()
+            logger.setLevel(logging.DEBUG)
+            logger.propagate = False
+            KIRA_LOGGING._created_by_get_logger.add(logger.name)
+
+        class OldCancellationSwallowingContext:
+            def __init__(self):
+                self.started = asyncio.Event()
+                self.emit_adapter_error = asyncio.Event()
+                self.adapter_error_emitted = asyncio.Event()
+                self.release = asyncio.Event()
+
+            async def send_message_chain(self, _session, _chain):
+                self.started.set()
+                while not self.emit_adapter_error.is_set():
+                    try:
+                        await self.emit_adapter_error.wait()
+                    except asyncio.CancelledError:
+                        continue
+                adapter_logger.error("synthetic adapter error from old send task")
+                self.adapter_error_emitted.set()
+                while not self.release.is_set():
+                    try:
+                        await self.release.wait()
+                    except asyncio.CancelledError:
+                        continue
+                return FakeResult()
+
+        class NewSuccessfulContext(FakeContext):
+            def __init__(self):
+                super().__init__()
+                self.sent_event = asyncio.Event()
+
+            async def send_message_chain(self, session, chain):
+                result = await super().send_message_chain(session, chain)
+                self.sent_event.set()
+                return result
+
+        old_ctx = OldCancellationSwallowingContext()
+        old_plugin = PLUGIN.ErrorNotifierPlugin(
+            old_ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "on_exception",
+                "target_session": "synthetic:dm:test-target",
+                "cooldown_seconds": 0,
+                "send_timeout_seconds": 1,
+            },
+        )
+        old_plugin.send_timeout_seconds = 0.03
+        await old_plugin.initialize()
+
+        new_module = load_plugin_module_same_host("context_marker")
+        new_ctx = NewSuccessfulContext()
+        new_plugin = new_module.ErrorNotifierPlugin(
+            new_ctx,
+            {
+                "enabled": True,
+                "monitor_mode": "all_error",
+                "target_session": "synthetic:dm:test-target",
+                "cooldown_seconds": 0,
+            },
+        )
+
+        try:
+            self.assertIs(
+                old_plugin._suppress_send_logs, new_plugin._suppress_send_logs
+            )
+            await old_plugin.handle_exception(
+                None,
+                KiraExceptionEvent(
+                    name="APIError",
+                    message="start old synthetic send",
+                    source="provider",
+                    comp_id="provider-gateway",
+                    stage="agent_loop",
+                ),
+            )
+            await asyncio.wait_for(old_ctx.started.wait(), timeout=0.2)
+            await asyncio.wait_for(old_plugin._queue.join(), timeout=0.2)
+            self.assertEqual(old_plugin.pending_send_count, 1)
+
+            await new_plugin.initialize()
+            old_ctx.emit_adapter_error.set()
+            await asyncio.wait_for(old_ctx.adapter_error_emitted.wait(), timeout=0.2)
+            business_logger.error("independent synthetic business error")
+            await asyncio.wait_for(new_ctx.sent_event.wait(), timeout=0.2)
+            for _ in range(3):
+                await asyncio.sleep(0)
+            await asyncio.wait_for(new_plugin._queue.join(), timeout=0.2)
+
+            self.assertEqual(new_plugin.delivery_stats.attempted, 1)
+            self.assertEqual(new_plugin.delivery_stats.delivered, 1)
+            self.assertEqual(len(new_ctx.sent), 1)
+            self.assertIn("independent synthetic business error", new_ctx.sent[0][1])
+            self.assertNotIn("adapter error from old send task", new_ctx.sent[0][1])
+        finally:
+            await new_plugin.terminate()
+            await old_plugin.terminate()
+            old_ctx.release.set()
+            for _ in range(5):
+                await asyncio.sleep(0)
+                if old_plugin.process_pending_send_count == 0:
+                    break
+            self.assertEqual(old_plugin.pending_send_count, 0)
+            self.assertEqual(old_plugin.process_pending_send_count, 0)
+            for logger in (adapter_logger, business_logger):
+                KIRA_LOGGING._created_by_get_logger.discard(logger.name)
+                logger.handlers.clear()
+
     async def test_authorization_redaction_is_consistent_outbound_and_in_send_log(self):
         class NegativeResultContext:
             def __init__(self):
